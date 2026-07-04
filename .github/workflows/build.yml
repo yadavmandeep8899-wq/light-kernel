@@ -24,9 +24,20 @@ jobs:
         run: |
           mkdir -p toolchain
           cd toolchain
-          curl -L -o clang.zip https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r416183b.zip
-          unzip -q clang.zip -d clang
-          echo "$GITHUB_WORKSPACE/toolchain/clang/bin" >> $GITHUB_PATH
+
+          curl -L -o clang.tar.gz \
+          "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/b669748458572622ed716407611633c5415da25c/clang-r416183b.tar.gz"
+
+           echo "===== FILE TYPE ====="
+          file clang.tar.gz
+
+           echo "===== ARCHIVE CONTENT ====="
+           tar -tf clang.tar.gz | head -20
+
+           mkdir clang
+           tar -xzf clang.tar.gz -C clang
+
+           echo "$GITHUB_WORKSPACE/toolchain/clang/bin" >> $GITHUB_PATH
       - name: Verify
         run: |
           clang --version || true
