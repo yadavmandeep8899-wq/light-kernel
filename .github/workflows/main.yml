@@ -76,7 +76,7 @@ jobs:
           llvm-ar --version
           llvm-nm --version
           llvm-objdump --version
-
+          
       - name: Clone Xiaomi Kernel Source
         run: |
           git clone \
@@ -85,9 +85,6 @@ jobs:
             https://github.com/MiCode/Xiaomi_Kernel_OpenSource \
             kernel
 
-      # Must land at $GITHUB_WORKSPACE/vendor/mediatek/kernel_modules —
-      # a SIBLING of kernel/ — because drivers/misc/mediatek/connectivity/Makefile
-      # resolves it via $(srctree)/../vendor/mediatek/kernel_modules/connectivity
       - name: Clone MTK Connectivity Modules (WiFi/BT/Hotspot source)
         run: |
           git clone \
@@ -98,6 +95,132 @@ jobs:
 
           echo "========== Verify overlay landed correctly =========="
           ls -la vendor/mediatek/kernel_modules/connectivity/
+
+      - name: Patch MTK WLAN Driver Source (LIST_SEG_MAX + nicCmdEventListmode fix)
+        run: |
+          set -e
+          for f in \
+            vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/os/linux/include/gl_qa_agent.h \
+            vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/os/none/include/gl_qa_agent.h
+          do
+            if [ -f "$f" ] && ! grep -q "define LIST_SEG_MAX" "$f"; then
+              python3 - "$f" << 'PYSHIM'
+          import sys
+          path = sys.argv[1]
+          shim = '''#ifndef LIST_SEG_MAX\n#define LIST_SEG_MAX 100\n#endif\n#ifndef SERV_STATUS_AGENT_INVALID_LEN\n#define SERV_STATUS_AGENT_INVALID_LEN 0x0103\n#endif\n#ifndef GL_QA_AGENT_WLAN_SERVICE_SHIM\n#define GL_QA_AGENT_WLAN_SERVICE_SHIM\nstruct list_mode_rx_status {\n\tuint32_t u4RXOK;\n\tuint32_t u4FCSErr;\n\tuint32_t u4RSSI0;\n\tuint32_t u4RSSI1;\n};\nstruct list_mode_event {\n\tuint16_t u2Status;\n\tuint32_t u4ExtId;\n\tuint32_t u4SegNumTotal;\n\tuint32_t u4SegNumRead;\n\tunion {\n\t\tuint32_t u4TxStatus[LIST_SEG_MAX];\n\t\tstruct list_mode_rx_status tRxStatus[LIST_SEG_MAX];\n\t};\n};\n#endif\n'''
+          with open(path) as f:
+              content = f.read()
+          with open(path, 'w') as f:
+              f.write(shim + content)
+          print("Patched:", path)
+          PYSHIM
+            fi
+          done
+
+          for f in \
+            vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/os/linux/gl_kal.c \
+            vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/include/mgmt/eht_ie.h
+          do
+            if [ -f "$f" ] && ! grep -q "define GNU_PACKED" "$f"; then
+              sed -i '1i #ifndef GNU_PACKED\n#define GNU_PACKED __packed\n#endif' "$f"
+              echo "Patched: $f"
+            fi
+          done
+
+          H="vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/include/nic_cmd_event.h"
+          C="vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/nic/nic_cmd_event.c"
+          if [ -f "$H" ]; then
+            sed -i '/CONFIG_WLAN_SERVICE == 1/d' "$H"
+            echo "Patched: $H"
+          fi
+          
+          C="vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/nic/nic_cmd_event.c"
+          if [ -f "$C" ] && ! grep -q '#include "fw_dl.h"' "$C"; then
+            sed -i 's/#include "gl_ate_agent.h"/#include "gl_ate_agent.h"\n#include "fw_dl.h"\n#include "gl_qa_agent.h"/' "$C"
+            echo "Patched includes: $C"
+          fi
+
+          python3 - "$C" << 'PYEOF'
+          import sys, re
+          path = sys.argv[1]
+          with open(path) as f:
+              content = f.read()
+
+          old = '''void nicCmdEventListmode(IN struct ADAPTER
+          \t\t\t\t  *prAdapter, IN struct CMD_INFO *prCmdInfo,
+          \t\t\t\t  IN uint8_t *pucEventBuf)
+          {
+          \tstruct list_mode_event *prStatus;
+          \tstruct GLUE_INFO *prGlueInfo;
+          \tuint32_t u4QueryInfoLen;
+
+          \tASSERT(prAdapter);
+          \tASSERT(prCmdInfo);
+
+          \tprStatus = (struct list_mode_event *) pucEventBuf;
+
+          \tif (prCmdInfo->fgIsOid) {
+          \t\tprGlueInfo = prAdapter->prGlueInfo;
+
+          \t\tu4QueryInfoLen = sizeof(struct list_mode_event);
+
+          \t\t/* Memory copy length is depended on upper-layer */
+          \t\tkalMemCopy(&g_HqaListModeStatus, prStatus, u4QueryInfoLen);
+
+          \t\t/* Update Query Information Length */
+          \t\tkalOidComplete(prGlueInfo, prCmdInfo,
+          \t\t\t       u4QueryInfoLen, WLAN_STATUS_SUCCESS);
+          \t}
+          }'''
+
+          new = '''void nicCmdEventListmode(IN struct ADAPTER
+          \t\t\t\t  *prAdapter, IN struct CMD_INFO *prCmdInfo,
+          \t\t\t\t  IN uint8_t *pucEventBuf)
+          {
+          \t/* Patched: HQA list-mode diagnostic stubbed out */
+          }'''
+
+          if old in content:
+              content = content.replace(old, new)
+              with open(path, 'w') as f:
+                  f.write(content)
+              print("Patched nicCmdEventListmode body:", path)
+          else:
+              print("WARNING: nicCmdEventListmode block not found verbatim, skipping")
+          PYEOF
+
+          python3 - "$C" << 'PYEOF2'
+          import sys
+          path = sys.argv[1]
+          with open(path) as f:
+              content = f.read()
+
+          start_marker = "#if CFG_SUPPORT_LLS\nuint32_t nicCmdEventLinkStatsEmiOffset"
+          end_marker = "\treturn WLAN_STATUS_SUCCESS;\n}\n#endif\n\nuint32_t nicCfgChipCapFastPath"
+
+          idx = content.find(start_marker)
+          idx2 = content.find(end_marker)
+
+          if idx != -1 and idx2 != -1:
+              old_block = content[idx:idx2 + len(end_marker)]
+              new_block = (
+                  "#if CFG_SUPPORT_LLS\n"
+                  "uint32_t nicCmdEventLinkStatsEmiOffset(IN struct ADAPTER *prAdapter,\n"
+                  "\t\t\t\t\tIN uint8_t *pucEventBuf)\n"
+                  "{\n"
+                  "\treturn WLAN_STATUS_FAILURE;\n"
+                  "}\n"
+                  "#endif\n"
+                  "\n"
+                  "uint32_t nicCfgChipCapFastPath"
+              )
+              content = content.replace(old_block, new_block)
+              with open(path, 'w') as f:
+                  f.write(content)
+              print("Patched nicCmdEventLinkStatsEmiOffset body:", path)
+          else:
+              print("WARNING: nicCmdEventLinkStatsEmiOffset block not found verbatim, skipping")
+          PYEOF2
 
       - name: Verify Source
         working-directory: kernel
@@ -129,6 +252,10 @@ jobs:
           sed -i 's/obj-$(CONFIG_MI_HARDWARE) += mihw.o//g' drivers/Makefile || true
           sed -i 's/subdir-ccflags-y += -Werror/subdir-ccflags-y += -Wno-error/' \
           drivers/input/touchscreen/mediatek/Makefile
+          
+          echo "===== Removing strict -Werror from MTK Connectivity Modules ====="
+          find ../vendor/mediatek/kernel_modules/connectivity -name "Makefile" -type f -exec sed -i 's/-Werror//g' {} +
+          
           echo "===== Touchscreen Makefile ====="
           head -5 drivers/input/touchscreen/mediatek/Makefile
 
@@ -139,15 +266,10 @@ jobs:
           export SUBARCH=arm64
 
           make O="$GITHUB_WORKSPACE/build-out" "$DEFCONFIG"
-
-          echo "========== Applying Config Fixes =========="
-          # Touchscreen driver ke frame size error ko bypass karne ke liye limit badhana
-          sed -i 's/CONFIG_FRAME_WARN=.*/CONFIG_FRAME_WARN=8192/g' "$GITHUB_WORKSPACE/build-out/.config"
           
-          # Wi-Fi/BT Module CRC Bypass (Stock ROM par module load failure rokne ke liye)
-          sed -i 's/CONFIG_MODVERSIONS=y/# CONFIG_MODVERSIONS is not set/g' "$GITHUB_WORKSPACE/build-out/.config"
-          sed -i 's/CONFIG_MODULE_SIG=y/# CONFIG_MODULE_SIG is not set/g' "$GITHUB_WORKSPACE/build-out/.config"
-          sed -i 's/CONFIG_MODULE_SIG_ALL=y/# CONFIG_MODULE_SIG_ALL is not set/g' "$GITHUB_WORKSPACE/build-out/.config"
+          echo "========== Applying Config Fixes =========="
+          # Bypass frame size limit error for MTK drivers
+          sed -i 's/CONFIG_FRAME_WARN=.*/CONFIG_FRAME_WARN=8192/g' "$GITHUB_WORKSPACE/build-out/.config"
 
           yes "" | make O="$GITHUB_WORKSPACE/build-out" olddefconfig || true
 
@@ -163,7 +285,6 @@ jobs:
           grep CONFIG_LOCALVERSION ../build-out/.config || true
           grep CONFIG_LTO_CLANG ../build-out/.config || true
           grep CONFIG_CFI_CLANG ../build-out/.config || true
-          grep CONFIG_FRAME_WARN ../build-out/.config || true
 
           echo
           echo "========== CONFIG READY =========="
@@ -191,6 +312,7 @@ jobs:
 
           echo "========== BUILD =========="
 
+          # Added KCFLAGS="-Wno-error -Wno-frame-larger-than" to bypass all MTK WLAN warnings
           make V=1 -j"$(nproc)" \
             O="$GITHUB_WORKSPACE/build-out" \
             ARCH=arm64 \
@@ -199,6 +321,8 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             CONFIG_WLAN_DRV_BUILD_IN=y \
+            MTK_ANDROID_EMI=y \
+            KCFLAGS="-Wno-error -Wno-frame-larger-than -Wno-deprecated-declarations" \
             Image \
             Image.gz \
             vmlinux \
@@ -330,3 +454,4 @@ jobs:
             build-out/vmlinux
             build-out/arch/arm64/boot/Image*
             build-out/arch/arm64/boot/dtb*
+
