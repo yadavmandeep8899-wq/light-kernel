@@ -1,4 +1,4 @@
-name: Build Stock Kernel C v14 (The Final Masterpiece)
+name: Build Stock Kernel C v11 (Restored 90% Base + 1 Line Fix)
 
 on:
   workflow_dispatch:
@@ -37,17 +37,11 @@ jobs:
       - name: Verify Android Clang
         run: |
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
-          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/clang/lib64:$LD_LIBRARY_PATH"
           clang --version
           
       - name: Clone Xiaomi Kernel Source
         run: |
           git clone --depth=1 --branch light-u-oss https://github.com/MiCode/Xiaomi_Kernel_OpenSource kernel
-
-      - name: CLEAN XIAOMI DIRTY SOURCE
-        working-directory: kernel
-        run: |
-          make ARCH=arm64 mrproper
 
       - name: Clone MTK Connectivity Modules
         run: |
@@ -56,6 +50,8 @@ jobs:
       - name: Patch MTK WLAN Driver Source
         run: |
           set -e
+          
+          # [YEH WAHI EXACT PYTHON PATCH HAI JO 90% TAK LE GAYA THA]
           for f in vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/os/linux/include/gl_qa_agent.h vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/os/none/include/gl_qa_agent.h; do
             if [ -f "$f" ] && ! grep -q "define LIST_SEG_MAX" "$f"; then
               python3 - "$f" << 'PYSHIM'
@@ -102,23 +98,15 @@ jobs:
               content = content.replace(old_block, new_block)
               with open(path, 'w') as f: f.write(content)
           PYEOF2
-
-          OID_C="vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/common/wlan_oid.c"
-          if [ -f "$OID_C" ]; then
-            cat >> "$OID_C" << 'EOF_OID'
-
-          /* Safe Dummy Function Inject to fix Linker Error */
-          unsigned int wlanoidListMode(void *a, void *b, void *c) { return 0; }
-          EOF_OID
-            echo "Successfully injected wlanoidListMode into wlan_oid.c"
-          fi
+          
+          # YAHI WOH SIRF EK LINE HAI JO AAKHIRI 10% WALE LINKER ERROR KO BYPASS KAREGI
+          echo "unsigned int wlanoidListMode(void) { return 0; }" >> vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/common/wlan_oid.c
 
       - name: Apply Required OSS Compile Fixes
         working-directory: kernel
         run: |
           set -e
           
-          echo "===== Bypassing MIHW ====="
           mkdir -p vendor/xiaomi/kernel_modules/mihw
           cat > vendor/xiaomi/kernel_modules/mihw/Makefile << 'EOF'
           obj-y :=
@@ -127,7 +115,6 @@ jobs:
           sed -i '/vendor\/xiaomi\/kernel_modules\/mihw/d' drivers/mihw/Makefile || true
           sed -i 's/obj-$(CONFIG_MI_HARDWARE) += mihw.o//g' drivers/Makefile || true
           
-          echo "===== Touchscreen Fix ====="
           sed -i 's/subdir-ccflags-y += -Werror/subdir-ccflags-y += -Wno-error/' drivers/input/touchscreen/mediatek/Makefile
           
           echo "===== Removing strict -Werror from MTK Connectivity Modules ====="
@@ -137,22 +124,16 @@ jobs:
         working-directory: kernel
         run: |
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
-          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/clang/lib64:$LD_LIBRARY_PATH"
           export ARCH=arm64
           export SUBARCH=arm64
 
           make O="$GITHUB_WORKSPACE/build-out" ARCH=arm64 LLVM=1 LLVM_IAS=1 "$DEFCONFIG"
           
-          echo "========== Applying Config Fixes =========="
           sed -i 's/CONFIG_FRAME_WARN=.*/CONFIG_FRAME_WARN=8192/g' "$GITHUB_WORKSPACE/build-out/.config"
           
           sed -i 's/CONFIG_MODVERSIONS=y/# CONFIG_MODVERSIONS is not set/g' "$GITHUB_WORKSPACE/build-out/.config"
           sed -i 's/CONFIG_MODULE_SIG=y/# CONFIG_MODULE_SIG is not set/g' "$GITHUB_WORKSPACE/build-out/.config"
           sed -i 's/CONFIG_MODULE_SIG_ALL=y/# CONFIG_MODULE_SIG_ALL is not set/g' "$GITHUB_WORKSPACE/build-out/.config"
-          
-          sed -i 's/CONFIG_MIHW=y/# CONFIG_MIHW is not set/g' "$GITHUB_WORKSPACE/build-out/.config"
-          sed -i 's/CONFIG_MIHW=m/# CONFIG_MIHW is not set/g' "$GITHUB_WORKSPACE/build-out/.config"
-          sed -i 's/CONFIG_MI_HARDWARE=y/# CONFIG_MI_HARDWARE is not set/g' "$GITHUB_WORKSPACE/build-out/.config"
 
           echo "CONFIG_WLAN_DRV_BUILD_IN=y" >> "$GITHUB_WORKSPACE/build-out/.config"
           echo "CONFIG_MTK_ANDROID_EMI=y" >> "$GITHUB_WORKSPACE/build-out/.config"
@@ -165,12 +146,10 @@ jobs:
           set -e
 
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
-          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/clang/lib64:$LD_LIBRARY_PATH"
           export ARCH=arm64
           export SUBARCH=arm64
 
-          echo "========== BUILD =========="
-
+          # WAHI SAME MAKE COMMAND JO V11 MEIN THI (NO EXPERIMENTS)
           make V=1 -j"$(nproc)" \
             O="$GITHUB_WORKSPACE/build-out" \
             ARCH=arm64 \
@@ -221,4 +200,3 @@ jobs:
         with:
           name: patched-stock-boot
           path: patched_boot.img
-
