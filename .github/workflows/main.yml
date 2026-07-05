@@ -1,4 +1,4 @@
-name: Build Stock Kernel C v13 (The Nuke Method + OID Fix)
+name: Build Stock Kernel C v14 (The Final Masterpiece)
 
 on:
   workflow_dispatch:
@@ -44,34 +44,14 @@ jobs:
         run: |
           git clone --depth=1 --branch light-u-oss https://github.com/MiCode/Xiaomi_Kernel_OpenSource kernel
 
+      - name: CLEAN XIAOMI DIRTY SOURCE
+        working-directory: kernel
+        run: |
+          make ARCH=arm64 mrproper
+
       - name: Clone MTK Connectivity Modules
         run: |
           git clone --depth=1 --branch light-u-oss https://github.com/MiCode/MTK_kernel_modules vendor/mediatek/kernel_modules
-
-      - name: NUKE 1 - Clean Xiaomi's Dirty Files (Force Delete)
-        working-directory: kernel
-        run: |
-          echo "Force deleting all generated junk left by Xiaomi..."
-          make ARCH=arm64 mrproper || true
-          rm -rf .config include/config include/generated arch/arm64/include/generated
-
-      - name: NUKE 2 - Completely Blank MIHW Makefiles
-        working-directory: kernel
-        run: |
-          echo "Making MIHW completely empty so compiler skips it..."
-          mkdir -p drivers/mihw
-          echo "" > drivers/mihw/Makefile
-          mkdir -p vendor/xiaomi/kernel_modules/mihw
-          echo "" > vendor/xiaomi/kernel_modules/mihw/Makefile
-          sed -i '/vendor\/xiaomi\/kernel_modules\/mihw/d' drivers/mihw/Makefile || true
-          sed -i 's/obj-$(CONFIG_MI_HARDWARE) += mihw.o//g' drivers/Makefile || true
-
-      - name: NUKE 3 - Destroy Strict Error Rules (-Werror)
-        working-directory: kernel
-        run: |
-          echo "Removing -Werror from Touchscreen and MTK Modules..."
-          find drivers/input/touchscreen/mediatek -name "Makefile" -exec sed -i 's/-Werror//g' {} + || true
-          find ../vendor/mediatek/kernel_modules -name "Makefile" -exec sed -i 's/-Werror//g' {} + || true
 
       - name: Patch MTK WLAN Driver Source
         run: |
@@ -125,20 +105,33 @@ jobs:
 
           OID_C="vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/common/wlan_oid.c"
           if [ -f "$OID_C" ]; then
-            python3 - "$OID_C" << 'PYEOF_OID'
-          import sys
-          path = sys.argv[1]
-          with open(path) as f:
-              lines = f.readlines()
-          last_inc = 0
-          for i, l in enumerate(lines):
-              if l.startswith("#include"):
-                  last_inc = i
-          lines.insert(last_inc + 1, "\n#define wlanoidListMode(...) 0\n")
-          with open(path, 'w') as f:
-              f.writelines(lines)
-          PYEOF_OID
+            cat >> "$OID_C" << 'EOF_OID'
+
+          /* Safe Dummy Function Inject to fix Linker Error */
+          unsigned int wlanoidListMode(void *a, void *b, void *c) { return 0; }
+          EOF_OID
+            echo "Successfully injected wlanoidListMode into wlan_oid.c"
           fi
+
+      - name: Apply Required OSS Compile Fixes
+        working-directory: kernel
+        run: |
+          set -e
+          
+          echo "===== Bypassing MIHW ====="
+          mkdir -p vendor/xiaomi/kernel_modules/mihw
+          cat > vendor/xiaomi/kernel_modules/mihw/Makefile << 'EOF'
+          obj-y :=
+          EOF
+
+          sed -i '/vendor\/xiaomi\/kernel_modules\/mihw/d' drivers/mihw/Makefile || true
+          sed -i 's/obj-$(CONFIG_MI_HARDWARE) += mihw.o//g' drivers/Makefile || true
+          
+          echo "===== Touchscreen Fix ====="
+          sed -i 's/subdir-ccflags-y += -Werror/subdir-ccflags-y += -Wno-error/' drivers/input/touchscreen/mediatek/Makefile
+          
+          echo "===== Removing strict -Werror from MTK Connectivity Modules ====="
+          find ../vendor/mediatek/kernel_modules/connectivity -name "Makefile" -type f -exec sed -i 's/-Werror//g' {} +
 
       - name: Generate Kernel Config
         working-directory: kernel
@@ -150,10 +143,16 @@ jobs:
 
           make O="$GITHUB_WORKSPACE/build-out" ARCH=arm64 LLVM=1 LLVM_IAS=1 "$DEFCONFIG"
           
+          echo "========== Applying Config Fixes =========="
           sed -i 's/CONFIG_FRAME_WARN=.*/CONFIG_FRAME_WARN=8192/g' "$GITHUB_WORKSPACE/build-out/.config"
+          
           sed -i 's/CONFIG_MODVERSIONS=y/# CONFIG_MODVERSIONS is not set/g' "$GITHUB_WORKSPACE/build-out/.config"
           sed -i 's/CONFIG_MODULE_SIG=y/# CONFIG_MODULE_SIG is not set/g' "$GITHUB_WORKSPACE/build-out/.config"
           sed -i 's/CONFIG_MODULE_SIG_ALL=y/# CONFIG_MODULE_SIG_ALL is not set/g' "$GITHUB_WORKSPACE/build-out/.config"
+          
+          sed -i 's/CONFIG_MIHW=y/# CONFIG_MIHW is not set/g' "$GITHUB_WORKSPACE/build-out/.config"
+          sed -i 's/CONFIG_MIHW=m/# CONFIG_MIHW is not set/g' "$GITHUB_WORKSPACE/build-out/.config"
+          sed -i 's/CONFIG_MI_HARDWARE=y/# CONFIG_MI_HARDWARE is not set/g' "$GITHUB_WORKSPACE/build-out/.config"
 
           echo "CONFIG_WLAN_DRV_BUILD_IN=y" >> "$GITHUB_WORKSPACE/build-out/.config"
           echo "CONFIG_MTK_ANDROID_EMI=y" >> "$GITHUB_WORKSPACE/build-out/.config"
@@ -164,10 +163,13 @@ jobs:
         working-directory: kernel
         run: |
           set -e
+
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
           export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/clang/lib64:$LD_LIBRARY_PATH"
           export ARCH=arm64
           export SUBARCH=arm64
+
+          echo "========== BUILD =========="
 
           make V=1 -j"$(nproc)" \
             O="$GITHUB_WORKSPACE/build-out" \
@@ -219,3 +221,4 @@ jobs:
         with:
           name: patched-stock-boot
           path: patched_boot.img
+
