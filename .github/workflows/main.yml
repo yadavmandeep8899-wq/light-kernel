@@ -1,0 +1,221 @@
+name: Build Stock Kernel C v13 (The Nuke Method + OID Fix)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      DEFCONFIG: light_defconfig
+
+    steps:
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex gawk git libelf-dev liblz4-tool libncurses-dev libssl-dev lld python3 unzip wget zip gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu
+
+      - name: Download Android Clang r383902
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/clang"
+          cd "$GITHUB_WORKSPACE/clang"
+          wget -O clang.tar.gz "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/3857008389202edac32d57008bb8c99d2c957f9d/clang-r383902.tar.gz"
+          tar -xzf clang.tar.gz
+
+      - name: Verify Android Clang
+        run: |
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/clang/lib64:$LD_LIBRARY_PATH"
+          clang --version
+          
+      - name: Clone Xiaomi Kernel Source
+        run: |
+          git clone --depth=1 --branch light-u-oss https://github.com/MiCode/Xiaomi_Kernel_OpenSource kernel
+
+      - name: Clone MTK Connectivity Modules
+        run: |
+          git clone --depth=1 --branch light-u-oss https://github.com/MiCode/MTK_kernel_modules vendor/mediatek/kernel_modules
+
+      - name: NUKE 1 - Clean Xiaomi's Dirty Files (Force Delete)
+        working-directory: kernel
+        run: |
+          echo "Force deleting all generated junk left by Xiaomi..."
+          make ARCH=arm64 mrproper || true
+          rm -rf .config include/config include/generated arch/arm64/include/generated
+
+      - name: NUKE 2 - Completely Blank MIHW Makefiles
+        working-directory: kernel
+        run: |
+          echo "Making MIHW completely empty so compiler skips it..."
+          mkdir -p drivers/mihw
+          echo "" > drivers/mihw/Makefile
+          mkdir -p vendor/xiaomi/kernel_modules/mihw
+          echo "" > vendor/xiaomi/kernel_modules/mihw/Makefile
+          sed -i '/vendor\/xiaomi\/kernel_modules\/mihw/d' drivers/mihw/Makefile || true
+          sed -i 's/obj-$(CONFIG_MI_HARDWARE) += mihw.o//g' drivers/Makefile || true
+
+      - name: NUKE 3 - Destroy Strict Error Rules (-Werror)
+        working-directory: kernel
+        run: |
+          echo "Removing -Werror from Touchscreen and MTK Modules..."
+          find drivers/input/touchscreen/mediatek -name "Makefile" -exec sed -i 's/-Werror//g' {} + || true
+          find ../vendor/mediatek/kernel_modules -name "Makefile" -exec sed -i 's/-Werror//g' {} + || true
+
+      - name: Patch MTK WLAN Driver Source
+        run: |
+          set -e
+          for f in vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/os/linux/include/gl_qa_agent.h vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/os/none/include/gl_qa_agent.h; do
+            if [ -f "$f" ] && ! grep -q "define LIST_SEG_MAX" "$f"; then
+              python3 - "$f" << 'PYSHIM'
+          import sys
+          path = sys.argv[1]
+          shim = '''#ifndef LIST_SEG_MAX\n#define LIST_SEG_MAX 100\n#endif\n#ifndef SERV_STATUS_AGENT_INVALID_LEN\n#define SERV_STATUS_AGENT_INVALID_LEN 0x0103\n#endif\n#ifndef GL_QA_AGENT_WLAN_SERVICE_SHIM\n#define GL_QA_AGENT_WLAN_SERVICE_SHIM\nstruct list_mode_rx_status {\n\tuint32_t u4RXOK;\n\tuint32_t u4FCSErr;\n\tuint32_t u4RSSI0;\n\tuint32_t u4RSSI1;\n};\nstruct list_mode_event {\n\tuint16_t u2Status;\n\tuint32_t u4ExtId;\n\tuint32_t u4SegNumTotal;\n\tuint32_t u4SegNumRead;\n\tunion {\n\t\tuint32_t u4TxStatus[LIST_SEG_MAX];\n\t\tstruct list_mode_rx_status tRxStatus[LIST_SEG_MAX];\n\t};\n};\n#endif\n'''
+          with open(path) as f: content = f.read()
+          with open(path, 'w') as f: f.write(shim + content)
+          PYSHIM
+            fi
+          done
+
+          for f in vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/os/linux/gl_kal.c vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/include/mgmt/eht_ie.h; do
+            if [ -f "$f" ] && ! grep -q "define GNU_PACKED" "$f"; then sed -i '1i #ifndef GNU_PACKED\n#define GNU_PACKED __packed\n#endif' "$f"; fi
+          done
+
+          H="vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/include/nic_cmd_event.h"
+          C="vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/nic/nic_cmd_event.c"
+          if [ -f "$H" ]; then sed -i '/CONFIG_WLAN_SERVICE == 1/d' "$H"; fi
+          if [ -f "$C" ] && ! grep -q '#include "fw_dl.h"' "$C"; then sed -i 's/#include "gl_ate_agent.h"/#include "gl_ate_agent.h"\n#include "fw_dl.h"\n#include "gl_qa_agent.h"/' "$C"; fi
+
+          python3 - "$C" << 'PYEOF'
+          import sys
+          path = sys.argv[1]
+          with open(path) as f: content = f.read()
+          old = '''void nicCmdEventListmode(IN struct ADAPTER\n\t\t\t\t  *prAdapter, IN struct CMD_INFO *prCmdInfo,\n\t\t\t\t  IN uint8_t *pucEventBuf)\n{\n\tstruct list_mode_event *prStatus;\n\tstruct GLUE_INFO *prGlueInfo;\n\tuint32_t u4QueryInfoLen;\n\n\tASSERT(prAdapter);\n\tASSERT(prCmdInfo);\n\n\tprStatus = (struct list_mode_event *) pucEventBuf;\n\n\tif (prCmdInfo->fgIsOid) {\n\t\tprGlueInfo = prAdapter->prGlueInfo;\n\n\t\tu4QueryInfoLen = sizeof(struct list_mode_event);\n\n\t\t/* Memory copy length is depended on upper-layer */\n\t\tkalMemCopy(&g_HqaListModeStatus, prStatus, u4QueryInfoLen);\n\n\t\t/* Update Query Information Length */\n\t\tkalOidComplete(prGlueInfo, prCmdInfo,\n\t\t\t       u4QueryInfoLen, WLAN_STATUS_SUCCESS);\n\t}\n}'''
+          new = '''void nicCmdEventListmode(IN struct ADAPTER\n\t\t\t\t  *prAdapter, IN struct CMD_INFO *prCmdInfo,\n\t\t\t\t  IN uint8_t *pucEventBuf)\n{\n\t/* Patched */\n}'''
+          if old in content:
+              content = content.replace(old, new)
+              with open(path, 'w') as f: f.write(content)
+          PYEOF
+
+          python3 - "$C" << 'PYEOF2'
+          import sys
+          path = sys.argv[1]
+          with open(path) as f: content = f.read()
+          start_marker = "#if CFG_SUPPORT_LLS\nuint32_t nicCmdEventLinkStatsEmiOffset"
+          end_marker = "\treturn WLAN_STATUS_SUCCESS;\n}\n#endif\n\nuint32_t nicCfgChipCapFastPath"
+          idx = content.find(start_marker)
+          idx2 = content.find(end_marker)
+          if idx != -1 and idx2 != -1:
+              old_block = content[idx:idx2 + len(end_marker)]
+              new_block = "#if CFG_SUPPORT_LLS\nuint32_t nicCmdEventLinkStatsEmiOffset(IN struct ADAPTER *prAdapter,\n\t\t\t\t\tIN uint8_t *pucEventBuf)\n{\n\treturn WLAN_STATUS_FAILURE;\n}\n#endif\n\n\nuint32_t nicCfgChipCapFastPath"
+              content = content.replace(old_block, new_block)
+              with open(path, 'w') as f: f.write(content)
+          PYEOF2
+
+          OID_C="vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/common/wlan_oid.c"
+          if [ -f "$OID_C" ]; then
+            python3 - "$OID_C" << 'PYEOF_OID'
+          import sys
+          path = sys.argv[1]
+          with open(path) as f:
+              lines = f.readlines()
+          last_inc = 0
+          for i, l in enumerate(lines):
+              if l.startswith("#include"):
+                  last_inc = i
+          lines.insert(last_inc + 1, "\n#define wlanoidListMode(...) 0\n")
+          with open(path, 'w') as f:
+              f.writelines(lines)
+          PYEOF_OID
+          fi
+
+      - name: Generate Kernel Config
+        working-directory: kernel
+        run: |
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/clang/lib64:$LD_LIBRARY_PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+
+          make O="$GITHUB_WORKSPACE/build-out" ARCH=arm64 LLVM=1 LLVM_IAS=1 "$DEFCONFIG"
+          
+          sed -i 's/CONFIG_FRAME_WARN=.*/CONFIG_FRAME_WARN=8192/g' "$GITHUB_WORKSPACE/build-out/.config"
+          sed -i 's/CONFIG_MODVERSIONS=y/# CONFIG_MODVERSIONS is not set/g' "$GITHUB_WORKSPACE/build-out/.config"
+          sed -i 's/CONFIG_MODULE_SIG=y/# CONFIG_MODULE_SIG is not set/g' "$GITHUB_WORKSPACE/build-out/.config"
+          sed -i 's/CONFIG_MODULE_SIG_ALL=y/# CONFIG_MODULE_SIG_ALL is not set/g' "$GITHUB_WORKSPACE/build-out/.config"
+
+          echo "CONFIG_WLAN_DRV_BUILD_IN=y" >> "$GITHUB_WORKSPACE/build-out/.config"
+          echo "CONFIG_MTK_ANDROID_EMI=y" >> "$GITHUB_WORKSPACE/build-out/.config"
+
+          yes "" | make O="$GITHUB_WORKSPACE/build-out" ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig || true
+
+      - name: Build Kernel
+        working-directory: kernel
+        run: |
+          set -e
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/clang/lib64:$LD_LIBRARY_PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+
+          make V=1 -j"$(nproc)" \
+            O="$GITHUB_WORKSPACE/build-out" \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            KCFLAGS="-Wno-error -Wno-frame-larger-than -Wno-deprecated-declarations" \
+            Image \
+            Image.gz \
+            vmlinux \
+            modules \
+            dtbs
+
+      - name: Download Stock Boot & MagiskBoot
+        run: |
+          wget -O boot.img https://github.com/testuru56-del/Stock-kernel/releases/download/Boot/boot.img
+          wget -O magiskboot https://github.com/testuru56-del/Stock-kernel/releases/download/Boot/magiskboot
+          chmod +x magiskboot
+
+      - name: Repack Stock Boot
+        run: |
+          mkdir work
+          cp boot.img work/
+          cp magiskboot work/
+          cd work
+
+          ./magiskboot unpack boot.img
+
+          if [ -f ../build-out/arch/arm64/boot/Image.gz ]; then
+              cp ../build-out/arch/arm64/boot/Image.gz kernel
+          elif [ -f ../build-out/arch/arm64/boot/Image ]; then
+              cp ../build-out/arch/arm64/boot/Image kernel
+          else
+              echo "Kernel image not found!"
+              exit 1
+          fi
+
+          if [ -f ../build-out/arch/arm64/boot/dtb.img ]; then
+              cp ../build-out/arch/arm64/boot/dtb.img dtb
+          fi
+
+          ./magiskboot repack boot.img
+          mv new-boot.img ../patched_boot.img
+
+      - name: Upload Patched Boot
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-stock-boot
+          path: patched_boot.img
