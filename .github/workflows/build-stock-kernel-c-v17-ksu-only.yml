@@ -1,0 +1,583 @@
+name: Build Stock Kernel C v2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      DEFCONFIG: light_defconfig
+
+    steps:
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            bc \
+            bison \
+            build-essential \
+            ccache \
+            curl \
+            flex \
+            gawk \
+            git \
+            libelf-dev \
+            liblz4-tool \
+            libncurses-dev \
+            libssl-dev \
+            lld \
+            python3 \
+            unzip \
+            wget \
+            zip \
+            gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi \
+            binutils-aarch64-linux-gnu
+
+      - name: Download Android Clang r383902
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/clang"
+
+          cd "$GITHUB_WORKSPACE/clang"
+
+          wget -O clang.tar.gz \
+          "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/3857008389202edac32d57008bb8c99d2c957f9d/clang-r383902.tar.gz"
+
+          tar -xzf clang.tar.gz
+
+      - name: Verify Android Clang
+        run: |
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/clang/lib64:$LD_LIBRARY_PATH"
+
+          echo "========== PATH =========="
+          which clang
+          which ld.lld
+          which llvm-ar
+
+          echo
+          echo "========== VERSION =========="
+          clang --version
+          ld.lld --version
+          llvm-ar --version
+          llvm-nm --version
+          llvm-objdump --version
+      - name: Clone Xiaomi Kernel Source
+        run: |
+          git clone \
+            --depth=1 \
+            --branch light-u-oss \
+            https://github.com/MiCode/Xiaomi_Kernel_OpenSource \
+            kernel
+
+      - name: Setup KernelSU (non-GKI, manual hook + susfs)
+        working-directory: kernel
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh" | bash -s susfs-rksu-master
+          echo "========== KernelSU source =========="
+          ls -la KernelSU 2>/dev/null || ls -la drivers/kernelsu 2>/dev/null || echo "KSU dir not found under expected paths"
+
+      # SUSFS integration deferred: susfs patches need BOTH a kernel-side
+      # patch AND a separate KernelSU-side patch, plus 2 hunks failed to
+      # apply cleanly against this Xiaomi tree (sched.h, fdinfo.c). Getting
+      # plain root working first unblocks on-device debugging; SUSFS can
+      # be layered in as its own milestone once root is confirmed working.
+
+      # Must land at $GITHUB_WORKSPACE/vendor/mediatek/kernel_modules —
+      # a SIBLING of kernel/ — because drivers/misc/mediatek/connectivity/Makefile
+      # resolves it via $(srctree)/../vendor/mediatek/kernel_modules/connectivity
+      - name: Clone MTK Connectivity Modules (WiFi/BT/Hotspot source)
+        run: |
+          git clone \
+            --depth=1 \
+            --branch light-u-oss \
+            https://github.com/MiCode/MTK_kernel_modules \
+            vendor/mediatek/kernel_modules
+
+          echo "========== Verify overlay landed correctly =========="
+          ls -la vendor/mediatek/kernel_modules/connectivity/
+
+      - name: Patch MTK WLAN Driver Source (LIST_SEG_MAX + nicCmdEventListmode fix)
+        run: |
+          set -e
+          for f in \
+            vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/os/linux/include/gl_qa_agent.h \
+            vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/os/none/include/gl_qa_agent.h
+          do
+            if [ -f "$f" ] && ! grep -q "define LIST_SEG_MAX" "$f"; then
+              python3 - "$f" << 'PYSHIM'
+          import sys
+          path = sys.argv[1]
+          shim = '''#ifndef LIST_SEG_MAX
+          #define LIST_SEG_MAX 100
+          #endif
+          #ifndef SERV_STATUS_AGENT_INVALID_LEN
+          #define SERV_STATUS_AGENT_INVALID_LEN 0x0103
+          #endif
+          #ifndef GL_QA_AGENT_WLAN_SERVICE_SHIM
+          #define GL_QA_AGENT_WLAN_SERVICE_SHIM
+          struct list_mode_rx_status {
+          \tuint32_t u4RXOK;
+          \tuint32_t u4FCSErr;
+          \tuint32_t u4RSSI0;
+          \tuint32_t u4RSSI1;
+          };
+          struct list_mode_event {
+          \tuint16_t u2Status;
+          \tuint32_t u4ExtId;
+          \tuint32_t u4SegNumTotal;
+          \tuint32_t u4SegNumRead;
+          \tunion {
+          \t\tuint32_t u4TxStatus[LIST_SEG_MAX];
+          \t\tstruct list_mode_rx_status tRxStatus[LIST_SEG_MAX];
+          \t};
+          };
+          #endif
+          '''
+          with open(path) as f:
+              content = f.read()
+          with open(path, 'w') as f:
+              f.write(shim + content)
+          print("Patched:", path)
+          PYSHIM
+            fi
+          done
+
+          # GNU_PACKED is only defined under the disabled wlan_service
+          # subsystem, but two core files use it unconditionally.
+          for f in \
+            vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/os/linux/gl_kal.c \
+            vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/include/mgmt/eht_ie.h
+          do
+            if [ -f "$f" ] && ! grep -q "define GNU_PACKED" "$f"; then
+              sed -i '1i #ifndef GNU_PACKED\n#define GNU_PACKED __packed\n#endif' "$f"
+              echo "Patched: $f"
+            fi
+          done
+
+          # nicCmdEventListmode is declared/defined only under
+          # CONFIG_WLAN_SERVICE==1, but wlan_oid.c calls it unconditionally.
+          # Remove the guard so it always compiles (its deps are already
+          # available unconditionally via gl_qa_agent.h/.c).
+          H="vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/include/nic_cmd_event.h"
+          C="vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/nic/nic_cmd_event.c"
+          if [ -f "$H" ]; then
+            sed -i '/CONFIG_WLAN_SERVICE == 1/d' "$H"
+            echo "Patched: $H"
+          fi
+          if [ -f "$C" ]; then
+            sed -i '/CONFIG_WLAN_SERVICE == 1/d' "$C"
+            echo "Patched: $C"
+          fi
+          # nic_cmd_event.c uses WIFI_EMI_ADDR_MASK (fw_dl.h) and
+          # gConEmiPhyBaseFinal (gl_qa_agent.h) but doesn't include either.
+          C="vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/nic/nic_cmd_event.c"
+          if [ -f "$C" ] && ! grep -q '#include "fw_dl.h"' "$C"; then
+            sed -i 's/#include "gl_ate_agent.h"/#include "gl_ate_agent.h"\n#include "fw_dl.h"\n#include "gl_qa_agent.h"/' "$C"
+            echo "Patched includes: $C"
+          fi
+
+          # Building the WiFi driver as built-in (not a .ko module) puts
+          # every non-static global symbol into the single flat vmlinux
+          # namespace, causing collisions with unrelated built-in drivers
+          # that happen to use the same generic names.
+          STP_UART="vendor/mediatek/kernel_modules/connectivity/common/common_main/linux/stp_uart.c"
+          if [ -f "$STP_UART" ]; then
+            sed -i 's/^spinlock_t buf_lock;/static spinlock_t buf_lock;/' "$STP_UART"
+            echo "Patched (static buf_lock): $STP_UART"
+          fi
+
+          GL_KAL="vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/os/linux/gl_kal.c"
+          if [ -f "$GL_KAL" ]; then
+            sed -i 's/^const struct firmware \*fw_entry;/static const struct firmware *fw_entry;/' "$GL_KAL"
+            echo "Patched (static fw_entry): $GL_KAL"
+          fi
+
+          GL_CFG80211="vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/os/linux/gl_cfg80211.c"
+          if [ -f "$GL_CFG80211" ]; then
+            sed -i 's/^bool is_world_regdom(const char \*alpha2)/static bool is_world_regdom(const char *alpha2)/' "$GL_CFG80211"
+            echo "Patched (static is_world_regdom): $GL_CFG80211"
+          fi
+
+          # KBUILD_SUBDIR_CCFLAGS propagation into the symlinked
+          # wlan_drv_gen4m directory is unreliable, so CFG_BUILT_IN_DRIVER
+          # stays 0 even though we ARE building in. That leaves MTK's
+          # local duplicate of is_world_regdom() active, colliding with
+          # the kernel's own net/wireless/reg.c symbol. Force it to 1
+          # directly since this pipeline always builds WiFi in.
+          GEN4M_MK="vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m/Makefile"
+          if [ -f "$GEN4M_MK" ] && grep -q "filter MTK_WCN_REMOVE_KERNEL_MODULE" "$GEN4M_MK"; then
+            python3 - "$GEN4M_MK" << 'PYEOF3'
+          import sys
+          path = sys.argv[1]
+          with open(path) as f:
+              content = f.read()
+          old = (
+              "ifneq ($(filter MTK_WCN_REMOVE_KERNEL_MODULE,$(KBUILD_SUBDIR_CCFLAGS)),)\n"
+              "    ccflags-y += -DCFG_BUILT_IN_DRIVER=1\n"
+              "else\n"
+              "    ccflags-y += -DCFG_BUILT_IN_DRIVER=0\n"
+              "endif"
+          )
+          new = "ccflags-y += -DCFG_BUILT_IN_DRIVER=1"
+          if old in content:
+              content = content.replace(old, new)
+              with open(path, 'w') as f:
+                  f.write(content)
+              print("Patched CFG_BUILT_IN_DRIVER (forced =1):", path)
+          else:
+              print("WARNING: CFG_BUILT_IN_DRIVER block not found verbatim, skipping")
+          PYEOF3
+          fi
+
+          # buf_lock is only referenced inside commented-out code, so
+          # marking it static now correctly triggers -Wunused-variable
+          # (promoted to error by -Werror). Genuinely dead, so drop it.
+          STP_UART="vendor/mediatek/kernel_modules/connectivity/common/common_main/linux/stp_uart.c"
+          if [ -f "$STP_UART" ]; then
+            sed -i 's/^static spinlock_t buf_lock;/static spinlock_t buf_lock __maybe_unused;/' "$STP_UART"
+            echo "Patched (buf_lock __maybe_unused): $STP_UART"
+          fi
+
+          # nicCmdEventListmode body needs the FULL struct list_mode_event
+          # definition (only available via CONFIG_WLAN_SERVICE's
+          # net_adaption.h, which we're not pulling in). Stub the body
+          # instead of pulling in the whole wlan_service subsystem —
+          # this is a diagnostic-only HQA test feature, not needed for
+          # basic WiFi/Hotspot.
+          python3 - "$C" << 'PYEOF'
+          import sys, re
+          path = sys.argv[1]
+          with open(path) as f:
+              content = f.read()
+
+          old = '''void nicCmdEventListmode(IN struct ADAPTER
+          \t\t\t\t  *prAdapter, IN struct CMD_INFO *prCmdInfo,
+          \t\t\t\t  IN uint8_t *pucEventBuf)
+          {
+          \tstruct list_mode_event *prStatus;
+          \tstruct GLUE_INFO *prGlueInfo;
+          \tuint32_t u4QueryInfoLen;
+
+          \tASSERT(prAdapter);
+          \tASSERT(prCmdInfo);
+
+          \tprStatus = (struct list_mode_event *) pucEventBuf;
+
+          \tif (prCmdInfo->fgIsOid) {
+          \t\tprGlueInfo = prAdapter->prGlueInfo;
+
+          \t\tu4QueryInfoLen = sizeof(struct list_mode_event);
+
+          \t\t/* Memory copy length is depended on upper-layer */
+          \t\tkalMemCopy(&g_HqaListModeStatus, prStatus, u4QueryInfoLen);
+
+          \t\t/* Update Query Information Length */
+          \t\tkalOidComplete(prGlueInfo, prCmdInfo,
+          \t\t\t       u4QueryInfoLen, WLAN_STATUS_SUCCESS);
+          \t}
+          }'''
+
+          new = '''void nicCmdEventListmode(IN struct ADAPTER
+          \t\t\t\t  *prAdapter, IN struct CMD_INFO *prCmdInfo,
+          \t\t\t\t  IN uint8_t *pucEventBuf)
+          {
+          \t/* Patched: HQA list-mode diagnostic stubbed out (needs
+          \t * CONFIG_WLAN_SERVICE's full struct list_mode_event definition)
+          \t */
+          }'''
+
+          if old in content:
+              content = content.replace(old, new)
+              with open(path, 'w') as f:
+                  f.write(content)
+              print("Patched nicCmdEventListmode body:", path)
+          else:
+              print("WARNING: nicCmdEventListmode block not found verbatim, skipping")
+          PYEOF
+
+          # nicCmdEventLinkStatsEmiOffset uses WIFI_EMI_ADDR_MASK /
+          # gConEmiPhyBaseFinal, both gated behind CFG_MTK_ANDROID_EMI
+          # (disabled in this build). Stub the body — LLS EMI stats
+          # is a diagnostic feature, not needed for basic WiFi/Hotspot.
+          python3 - "$C" << 'PYEOF2'
+          import sys
+          path = sys.argv[1]
+          with open(path) as f:
+              content = f.read()
+
+          start_marker = "#if CFG_SUPPORT_LLS\nuint32_t nicCmdEventLinkStatsEmiOffset"
+          end_marker = "\treturn WLAN_STATUS_SUCCESS;\n}\n#endif\n\nuint32_t nicCfgChipCapFastPath"
+
+          idx = content.find(start_marker)
+          idx2 = content.find(end_marker)
+
+          if idx != -1 and idx2 != -1:
+              old_block = content[idx:idx2 + len(end_marker)]
+              new_block = (
+                  "#if CFG_SUPPORT_LLS\n"
+                  "uint32_t nicCmdEventLinkStatsEmiOffset(IN struct ADAPTER *prAdapter,\n"
+                  "\t\t\t\t\tIN uint8_t *pucEventBuf)\n"
+                  "{\n"
+                  "\t/* Patched: LLS EMI offset feature stubbed out (requires\n"
+                  "\t * CFG_MTK_ANDROID_EMI, disabled in this build)\n"
+                  "\t */\n"
+                  "\treturn WLAN_STATUS_FAILURE;\n"
+                  "}\n"
+                  "#endif\n"
+                  "\n"
+                  "uint32_t nicCfgChipCapFastPath"
+              )
+              content = content.replace(old_block, new_block)
+              with open(path, 'w') as f:
+                  f.write(content)
+              print("Patched nicCmdEventLinkStatsEmiOffset body:", path)
+          else:
+              print("WARNING: nicCmdEventLinkStatsEmiOffset block not found verbatim, skipping")
+          PYEOF2
+
+      - name: Verify Source
+        working-directory: kernel
+        run: |
+          echo "========== SOURCE =========="
+          git log -1 --oneline
+
+          echo
+          make kernelversion
+
+      - name: Set Build Environment
+        run: |
+          echo "ARCH=arm64" >> $GITHUB_ENV
+          echo "SUBARCH=arm64" >> $GITHUB_ENV
+          echo "DEFCONFIG=light_defconfig" >> $GITHUB_ENV
+
+      - name: Apply Required OSS Compile Fixes
+        working-directory: kernel
+        run: |
+          set -e
+
+          mkdir -p vendor/xiaomi/kernel_modules/mihw
+
+          cat > vendor/xiaomi/kernel_modules/mihw/Makefile << 'EOF'
+          obj-y :=
+          EOF
+
+          sed -i '/vendor\/xiaomi\/kernel_modules\/mihw/d' drivers/mihw/Makefile || true
+          sed -i 's/obj-$(CONFIG_MI_HARDWARE) += mihw.o//g' drivers/Makefile || true
+          sed -i 's/subdir-ccflags-y += -Werror/subdir-ccflags-y += -Wno-error/' \
+          drivers/input/touchscreen/mediatek/Makefile
+          echo "===== Touchscreen Makefile ====="
+          head -5 drivers/input/touchscreen/mediatek/Makefile
+
+          echo "===== Adding KernelSU (manual hook) config flags ====="
+          CONFIG_FILE="arch/arm64/configs/$DEFCONFIG"
+          cat >> "$CONFIG_FILE" << 'KSUEOF'
+          CONFIG_KSU=y
+          CONFIG_KSU_MANUAL_HOOK=y
+          CONFIG_KALLSYMS=y
+          CONFIG_KALLSYMS_ALL=y
+          KSUEOF
+          echo "===== Final defconfig KSU section ====="
+          grep "KSU\|KALLSYMS" "$CONFIG_FILE"
+
+      - name: Generate Kernel Config
+        working-directory: kernel
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+
+          make O="$GITHUB_WORKSPACE/build-out" "$DEFCONFIG"
+
+          yes "" | make O="$GITHUB_WORKSPACE/build-out" olddefconfig || true
+
+      - name: Verify Config
+        working-directory: kernel
+        run: |
+          echo "========== Kernel Config =========="
+
+          test -f ../build-out/.config
+
+          ls -lh ../build-out/.config
+
+          grep CONFIG_LOCALVERSION ../build-out/.config || true
+          grep CONFIG_LTO_CLANG ../build-out/.config || true
+          grep CONFIG_CFI_CLANG ../build-out/.config || true
+
+          echo
+          echo "========== CONFIG READY =========="
+      - name: Build Kernel
+        working-directory: kernel
+        run: |
+          set -e
+
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/clang/lib64:$LD_LIBRARY_PATH"
+
+          export ARCH=arm64
+          export SUBARCH=arm64
+
+          export LLVM=1
+          export LLVM_IAS=1
+
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+
+          echo "========== TOOLCHAIN =========="
+          which clang
+          clang --version
+
+          echo "========== BUILD =========="
+
+          make V=1 -j"$(nproc)" \
+            O="$GITHUB_WORKSPACE/build-out" \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            CONFIG_WLAN_DRV_BUILD_IN=y \
+            MTK_ANDROID_EMI=y \
+            Image \
+            Image.gz \
+            vmlinux \
+            modules \
+            dtbs
+
+      - name: Verify WiFi/Connectivity Actually Compiled
+        working-directory: kernel
+        run: |
+          echo "========== connadp / wmt_drv / wlan_drv_gen4m symbols in vmlinux =========="
+          nm ../build-out/vmlinux 2>/dev/null | grep -iE "wmt_drv_init|wlan_probe|connadp" | head -20 \
+            || echo "WARNING: expected WiFi/WMT symbols NOT found — build-in overlay likely did not trigger"
+
+          echo
+          echo "========== Confirm symlinks were created by connectivity/Makefile =========="
+          ls -la drivers/misc/mediatek/connectivity/wmt_drv 2>&1 || echo "wmt_drv symlink missing"
+          ls -la drivers/misc/mediatek/connectivity/wlan_drv_gen4m 2>&1 || echo "wlan_drv_gen4m symlink missing"
+
+      - name: Verify Build Outputs
+        working-directory: kernel
+        run: |
+          echo "========== OUTPUT =========="
+
+          ls -lah ../build-out/arch/arm64/boot/
+
+          test -f ../build-out/arch/arm64/boot/Image
+          test -f ../build-out/arch/arm64/boot/Image.gz
+
+          ls -lh ../build-out/.config || true
+          ls -lh ../build-out/System.map || true
+          ls -lh ../build-out/Module.symvers || true
+          ls -lh ../build-out/vmlinux || true
+
+      - name: Print Build Information
+        working-directory: kernel
+        run: |
+          echo "========== IMAGE =========="
+          file ../build-out/arch/arm64/boot/Image
+          file ../build-out/arch/arm64/boot/Image.gz
+
+          echo
+          echo "========== SIZE =========="
+          du -h ../build-out/arch/arm64/boot/Image
+          du -h ../build-out/arch/arm64/boot/Image.gz
+          du -h ../build-out/vmlinux || true
+
+      - name: List Important Files
+        working-directory: kernel
+        run: |
+          find ../build-out -maxdepth 2 -type f | sort
+      - name: Download Stock Boot
+        run: |
+          wget -O boot.img \
+          https://github.com/testuru56-del/Stock-kernel/releases/download/Boot/boot.img
+
+      - name: Download MagiskBoot
+        run: |
+          wget -O magiskboot \
+          https://github.com/testuru56-del/Stock-kernel/releases/download/Boot/magiskboot
+
+          chmod +x magiskboot
+
+      - name: Analyze Stock Boot
+        run: |
+          mkdir stock
+
+          cp boot.img stock/
+          cp magiskboot stock/
+
+          cd stock
+
+          ./magiskboot unpack boot.img
+
+          echo "========== Stock Boot =========="
+          ls -lh
+
+          file kernel || true
+          file kernel_dtb || true
+          file dtb || true
+
+      - name: Repack Stock Boot
+        run: |
+          mkdir work
+
+          cp boot.img work/
+          cp magiskboot work/
+
+          cd work
+
+          ./magiskboot unpack boot.img
+
+          if [ -f ../build-out/arch/arm64/boot/Image.gz ]; then
+              cp ../build-out/arch/arm64/boot/Image.gz kernel
+          elif [ -f ../build-out/arch/arm64/boot/Image ]; then
+              cp ../build-out/arch/arm64/boot/Image kernel
+          else
+              echo "Kernel image not found!"
+              exit 1
+          fi
+
+          if [ -f ../build-out/arch/arm64/boot/dtb.img ]; then
+              cp ../build-out/arch/arm64/boot/dtb.img dtb
+          fi
+
+          ./magiskboot repack boot.img
+
+          mv new-boot.img ../patched_boot.img
+
+      - name: Verify Patched Boot
+        run: |
+          ls -lh patched_boot.img
+          sha1sum patched_boot.img
+
+      - name: Upload Patched Boot
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-stock-boot
+          path: patched_boot.img
+
+      - name: Upload Kernel Files
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-build-files
+          path: |
+            build-out/.config
+            build-out/System.map
+            build-out/Module.symvers
+            build-out/vmlinux
+            build-out/arch/arm64/boot/Image*
+            build-out/arch/arm64/boot/dtb*
