@@ -28,4 +28,5 @@ A clean, stable, and completely unmodified custom kernel built straight from the
    fastboot flash boot boot.img
    fastboot reboot
 ​Base Source: MiCode/Xiaomi_Kernel_OpenSource
+
 ​Maintained by: **Mandeep Yadav**
