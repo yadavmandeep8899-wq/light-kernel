@@ -577,12 +577,12 @@ jobs:
       - name: Download Stock Boot
         run: |
           wget -O boot.img \
-          https://github.com/testuru56-del/Stock-kernel/releases/download/Boot/boot.img
+          https://github.com/yadavmandeep8899-wq/Poco-m4-stock-kernel/releases/download/Boot/boot.img
 
       - name: Download MagiskBoot
         run: |
           wget -O magiskboot \
-          https://github.com/testuru56-del/Stock-kernel/releases/download/Boot/magiskboot
+          https://github.com/yadavmandeep8899-wq/Poco-m4-stock-kernel/releases/download/Boot/magiskboot
 
           chmod +x magiskboot
 
